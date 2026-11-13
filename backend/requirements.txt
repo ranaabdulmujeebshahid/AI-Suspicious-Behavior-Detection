@@ -1,0 +1,9 @@
+ultralytics
+mediapipe
+opencv-python-headless
+fastapi
+uvicorn[standard]
+python-multipart
+pandas
+scikit-learn
+joblib
