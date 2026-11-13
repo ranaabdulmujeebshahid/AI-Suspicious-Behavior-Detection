@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+venv/
+backend/dataset/*
+!backend/dataset/.gitkeep
+backend/models/*
+!backend/models/.gitkeep
+*.pt
+*.pkl
+*.mp4
+*.zip
+node_modules/
