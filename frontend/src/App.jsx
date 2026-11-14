@@ -11,10 +11,20 @@ export default function App() {
   const [apiUrl, setApiUrl] = useState("http://127.0.0.1:8000");
   const [mode, setMode] = useState("frame");
   const [file, setFile] = useState(null);
+  const [previewUrl, setPreviewUrl] = useState("");
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState("");
   const canvasRef = useRef(null);
+  const videoRef = useRef(null);
+
+  const handleFileChange = (e) => {
+    const selected = e.target.files[0] || null;
+    setFile(selected);
+    setResult(null);
+    setError("");
+    setPreviewUrl(selected ? URL.createObjectURL(selected) : "");
+  };
 
   const drawFrameWithSkeleton = (imageUrl, detections) => {
     const img = new Image();
@@ -79,19 +89,27 @@ export default function App() {
     try {
       const formData = new FormData();
       formData.append("file", file);
-      const endpoint = mode === "frame" ? "/analyze-frame" : "/analyze-video?frame_stride=15";
-      const res = await fetch(`${apiUrl}${endpoint}`, { method: "POST", body: formData });
+      const cleanUrl = apiUrl.replace(/\/+$/, "");
+      const endpoint = mode === "frame" ? "/analyze-frame" : "/analyze-video?frame_stride=20";
+      const res = await fetch(`${cleanUrl}${endpoint}`, { method: "POST", body: formData });
       if (!res.ok) throw new Error(`Server responded with ${res.status}`);
       const data = await res.json();
       setResult(data);
 
       if (mode === "frame") {
-        drawFrameWithSkeleton(URL.createObjectURL(file), data.detections || []);
+        drawFrameWithSkeleton(previewUrl, data.detections || []);
       }
     } catch (err) {
       setError(err.message || "Failed to connect to FastAPI server.");
     } finally {
       setLoading(false);
+    }
+  };
+
+  const seekToTimestamp = (sec) => {
+    if (videoRef.current) {
+      videoRef.current.currentTime = sec;
+      videoRef.current.play();
     }
   };
 
@@ -118,13 +136,13 @@ export default function App() {
           <div className="tabs">
             <button
               className={mode === "frame" ? "" : "secondary"}
-              onClick={() => { setMode("frame"); setResult(null); }}
+              onClick={() => { setMode("frame"); setFile(null); setPreviewUrl(""); setResult(null); }}
             >
               CCTV Frame (Image)
             </button>
             <button
               className={mode === "video" ? "" : "secondary"}
-              onClick={() => { setMode("video"); setResult(null); }}
+              onClick={() => { setMode("video"); setFile(null); setPreviewUrl(""); setResult(null); }}
             >
               CCTV Clip (Video)
             </button>
@@ -132,7 +150,7 @@ export default function App() {
           <input
             type="file"
             accept={mode === "frame" ? "image/*" : "video/*"}
-            onChange={(e) => setFile(e.target.files[0] || null)}
+            onChange={handleFileChange}
           />
           <button onClick={handleAnalyze} disabled={!file || loading}>
             {loading ? "Analyzing Pose Skeletons..." : "Run Behavior Detection"}
@@ -144,12 +162,14 @@ export default function App() {
 
       <div className="workspace">
         <div className="card">
-          <h3>Skeleton Overlay Preview</h3>
+          <h3>{mode === "frame" ? "Skeleton Overlay Preview" : "CCTV Video Player"}</h3>
           {mode === "frame" ? (
             <canvas ref={canvasRef} />
+          ) : previewUrl ? (
+            <video ref={videoRef} src={previewUrl} controls style={{ width: "100%", borderRadius: "10px" }} />
           ) : (
             <p style={{ color: "var(--muted)", fontSize: "14px" }}>
-              Video timeline alerts appear on the right with exact timestamps and confidence scores.
+              Select a CCTV video to preview and jump to flagged timestamps.
             </p>
           )}
         </div>
@@ -180,8 +200,13 @@ export default function App() {
                 <div className="alert-item">No suspicious behavior detected.</div>
               )}
               {result.timeline.map((ev, idx) => (
-                <div key={idx} className="alert-item danger">
-                  <strong>Timestamp: {ev.timestamp_sec}s</strong> (Frame {ev.frame})
+                <div
+                  key={idx}
+                  className="alert-item danger"
+                  style={{ cursor: "pointer" }}
+                  onClick={() => seekToTimestamp(ev.timestamp_sec)}
+                >
+                  <strong>Timestamp: {ev.timestamp_sec}s</strong> (Frame {ev.frame}) — <u>Click to jump</u>
                   {ev.alerts.map((a, j) => (
                     <div key={j}>{a.behavior} — {(a.confidence * 100).toFixed(1)}%</div>
                   ))}

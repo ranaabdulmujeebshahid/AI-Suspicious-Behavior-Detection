@@ -1,4 +1,5 @@
 import os
+import sys
 import tempfile
 import cv2
 import joblib
@@ -12,12 +13,17 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
+from pose_utils import extract_pose_features
+
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 YOLO_PATH = os.path.join(MODELS_DIR, "yolov8n.pt")
 TASK_MODEL_PATH = os.path.join(MODELS_DIR, "pose_landmarker_lite.task")
 RF_MODEL_PATH = os.path.join(MODELS_DIR, "behavior_rf_model.pkl")
 
-app = FastAPI(title="AI Suspicious Behavior Detection API", version="1.0.0")
+app = FastAPI(title="AI Suspicious Behavior Detection API", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,14 +34,10 @@ app.add_middleware(
 )
 
 yolo = YOLO(YOLO_PATH)
-
 base_options = mp_python.BaseOptions(model_asset_path=TASK_MODEL_PATH)
-pose_options = vision.PoseLandmarkerOptions(
-    base_options=base_options,
-    running_mode=vision.RunningMode.IMAGE,
-    num_poses=1
+landmarker = vision.PoseLandmarker.create_from_options(
+    vision.PoseLandmarkerOptions(base_options=base_options, running_mode=vision.RunningMode.IMAGE, num_poses=1)
 )
-landmarker = vision.PoseLandmarker.create_from_options(pose_options)
 
 bundle = joblib.load(RF_MODEL_PATH)
 clf = bundle["model"]
@@ -43,9 +45,9 @@ feature_columns = bundle["feature_columns"]
 classes = bundle["classes"]
 
 
-def process_bgr_frame(frame: np.ndarray, conf_threshold: float = 0.60):
+def process_bgr_frame(frame: np.ndarray, suspicious_threshold: float = 0.65):
     h, w, _ = frame.shape
-    results = yolo.predict(frame, classes=[0], conf=0.4, verbose=False)
+    results = yolo.predict(frame, classes=[0], conf=0.45, verbose=False)
     detections = []
 
     for box in results[0].boxes.xyxy.cpu().numpy():
@@ -62,18 +64,27 @@ def process_bgr_frame(frame: np.ndarray, conf_threshold: float = 0.60):
         if not pose_res.pose_landmarks:
             continue
 
-        feats = []
-        skeleton = []
-        for lm in pose_res.pose_landmarks[0]:
-            feats.extend([lm.x, lm.y, lm.z, float(lm.visibility or 0.0)])
-            skeleton.append({"x": round(lm.x, 4), "y": round(lm.y, 4)})
+        landmarks = pose_res.pose_landmarks[0]
+        feats = extract_pose_features(landmarks)
+        skeleton = [{"x": round(lm.x, 4), "y": round(lm.y, 4)} for lm in landmarks]
 
         X_df = pd.DataFrame([feats], columns=feature_columns)
         probs = clf.predict_proba(X_df)[0]
-        best_idx = int(np.argmax(probs))
-        label = str(classes[best_idx])
-        confidence = float(probs[best_idx])
-        is_suspicious = (label != "Normal") and (confidence >= conf_threshold)
+        prob_map = dict(zip(classes, probs))
+
+        normal_prob = float(prob_map.get("Normal", 0.0))
+        suspicious_prob = 1.0 - normal_prob
+        sus_classes = [c for c in classes if c != "Normal"]
+        best_sus_label = max(sus_classes, key=lambda c: prob_map[c])
+
+        if suspicious_prob >= suspicious_threshold:
+            label = best_sus_label
+            confidence = suspicious_prob
+            is_suspicious = True
+        else:
+            label = "Normal"
+            confidence = normal_prob
+            is_suspicious = False
 
         detections.append({
             "bbox": [x1, y1, x2, y2],
@@ -84,6 +95,11 @@ def process_bgr_frame(frame: np.ndarray, conf_threshold: float = 0.60):
         })
 
     return detections
+
+
+@app.get("/")
+def root():
+    return {"status": "online", "docs": "/docs"}
 
 
 @app.get("/health")
@@ -112,7 +128,7 @@ async def analyze_frame(file: UploadFile = File(...)):
 
 
 @app.post("/analyze-video")
-async def analyze_video(file: UploadFile = File(...), frame_stride: int = 15):
+async def analyze_video(file: UploadFile = File(...), frame_stride: int = 20):
     suffix = os.path.splitext(file.filename or "upload.mp4")[1] or ".mp4"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(await file.read())
