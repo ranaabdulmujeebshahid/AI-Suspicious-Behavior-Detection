@@ -1,5 +1,8 @@
 import os
 import sys
+import json
+import base64
+import asyncio
 import tempfile
 import cv2
 import joblib
@@ -9,7 +12,7 @@ import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 from ultralytics import YOLO
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -23,7 +26,27 @@ YOLO_PATH = os.path.join(MODELS_DIR, "yolov8n.pt")
 TASK_MODEL_PATH = os.path.join(MODELS_DIR, "pose_landmarker_lite.task")
 RF_MODEL_PATH = os.path.join(MODELS_DIR, "behavior_rf_model.pkl")
 
-app = FastAPI(title="AI Suspicious Behavior Detection API", version="1.1.0")
+SEVERITY_META = {
+    "Shooting": {"severity": "CRITICAL", "desc": "Active firearm posture detected"},
+    "Explosion": {"severity": "CRITICAL", "desc": "Blast reaction / sudden drop detected"},
+    "Arson": {"severity": "CRITICAL", "desc": "Suspicious fire-setting activity"},
+    "RoadAccidents": {"severity": "CRITICAL", "desc": "Collision / pedestrian impact posture"},
+    "Critical_Threat": {"severity": "CRITICAL", "desc": "High-severity threat posture"},
+    "Fighting": {"severity": "HIGH", "desc": "Physical altercation in progress"},
+    "Assault": {"severity": "HIGH", "desc": "Violent physical strike detected"},
+    "Abuse": {"severity": "HIGH", "desc": "Aggressive physical abuse posture"},
+    "Robbery": {"severity": "HIGH", "desc": "Forceful confrontation / robbery"},
+    "Arrest": {"severity": "HIGH", "desc": "Restraint / struggle posture"},
+    "Fighting_Assault": {"severity": "HIGH", "desc": "Physical assault / fighting detected"},
+    "Burglary": {"severity": "MEDIUM", "desc": "Forced entry / trespassing posture"},
+    "Shoplifting": {"severity": "MEDIUM", "desc": "Concealment / retail theft posture"},
+    "Stealing": {"severity": "MEDIUM", "desc": "Unauthorized item snatching"},
+    "Vandalism": {"severity": "MEDIUM", "desc": "Property destruction posture"},
+    "Robbery_Theft": {"severity": "MEDIUM", "desc": "Theft / unauthorized taking posture"},
+    "Normal": {"severity": "SAFE", "desc": "Routine movement"},
+}
+
+app = FastAPI(title="AI Suspicious Behavior Detection API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -45,7 +68,7 @@ feature_columns = bundle["feature_columns"]
 classes = bundle["classes"]
 
 
-def process_bgr_frame(frame: np.ndarray, suspicious_threshold: float = 0.65):
+def process_bgr_frame(frame: np.ndarray, suspicious_threshold: float = 0.62):
     h, w, _ = frame.shape
     results = yolo.predict(frame, classes=[0], conf=0.45, verbose=False)
     detections = []
@@ -54,7 +77,7 @@ def process_bgr_frame(frame: np.ndarray, suspicious_threshold: float = 0.65):
         x1, y1, x2, y2 = map(int, box)
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(w, x2), min(h, y2)
-        if (x2 - x1) < 30 or (y2 - y1) < 50:
+        if (x2 - x1) < 24 or (y2 - y1) < 40:
             continue
 
         crop = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2RGB)
@@ -75,7 +98,7 @@ def process_bgr_frame(frame: np.ndarray, suspicious_threshold: float = 0.65):
         normal_prob = float(prob_map.get("Normal", 0.0))
         suspicious_prob = 1.0 - normal_prob
         sus_classes = [c for c in classes if c != "Normal"]
-        best_sus_label = max(sus_classes, key=lambda c: prob_map[c])
+        best_sus_label = max(sus_classes, key=lambda c: prob_map[c]) if sus_classes else "Critical_Threat"
 
         if suspicious_prob >= suspicious_threshold:
             label = best_sus_label
@@ -86,9 +109,12 @@ def process_bgr_frame(frame: np.ndarray, suspicious_threshold: float = 0.65):
             confidence = normal_prob
             is_suspicious = False
 
+        meta = SEVERITY_META.get(label, {"severity": "HIGH" if is_suspicious else "SAFE", "desc": label})
         detections.append({
             "bbox": [x1, y1, x2, y2],
             "behavior": label,
+            "severity": meta["severity"],
+            "description": meta["desc"],
             "confidence": round(confidence, 4),
             "alert": is_suspicious,
             "skeleton": skeleton
@@ -97,9 +123,17 @@ def process_bgr_frame(frame: np.ndarray, suspicious_threshold: float = 0.65):
     return detections
 
 
+def decode_base64_image(data_url: str):
+    if "," in data_url:
+        data_url = data_url.split(",", 1)[1]
+    img_bytes = base64.b64decode(data_url)
+    np_arr = np.frombuffer(img_bytes, np.uint8)
+    return cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+
 @app.get("/")
 def root():
-    return {"status": "online", "docs": "/docs"}
+    return {"status": "online", "version": "2.0.0", "classes": classes}
 
 
 @app.get("/health")
@@ -127,41 +161,72 @@ async def analyze_frame(file: UploadFile = File(...)):
     }
 
 
-@app.post("/analyze-video")
-async def analyze_video(file: UploadFile = File(...), frame_stride: int = 20):
-    suffix = os.path.splitext(file.filename or "upload.mp4")[1] or ".mp4"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(await file.read())
-        tmp_path = tmp.name
+@app.websocket("/ws/surveillance")
+async def surveillance_ws(websocket: WebSocket):
+    await websocket.accept()
+    stream_task = None
+
+    async def run_cctv_stream(stream_url: str):
+        cap = cv2.VideoCapture(stream_url)
+        if not cap.isOpened():
+            await websocket.send_json({"type": "error", "message": "Unable to open CCTV stream URL. Verify link is public and online."})
+            return
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    await websocket.send_json({"type": "error", "message": "CCTV stream ended or disconnected."})
+                    break
+                h, w = frame.shape[:2]
+                if w > 640:
+                    scale = 640.0 / w
+                    frame = cv2.resize(frame, (640, int(h * scale)))
+                detections = process_bgr_frame(frame)
+                _, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+                b64 = base64.b64encode(buf).decode("utf-8")
+                await websocket.send_json({
+                    "type": "stream_frame",
+                    "image": f"data:image/jpeg;base64,{b64}",
+                    "width": frame.shape[1],
+                    "height": frame.shape[0],
+                    "detections": detections
+                })
+                await asyncio.sleep(0.22)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            cap.release()
 
     try:
-        cap = cv2.VideoCapture(tmp_path)
-        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        frame_idx = 0
-        timeline = []
+        while True:
+            raw = await websocket.receive_text()
+            msg = json.loads(raw)
+            action = msg.get("action")
 
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-            if frame_idx % frame_stride == 0:
-                detections = process_bgr_frame(frame)
-                alerts = [d for d in detections if d["alert"]]
-                if alerts:
-                    timeline.append({
-                        "frame": frame_idx,
-                        "timestamp_sec": round(frame_idx / fps, 2),
-                        "alerts": alerts
+            if action == "frame":
+                frame = decode_base64_image(msg.get("image", ""))
+                if frame is not None:
+                    detections = process_bgr_frame(frame)
+                    await websocket.send_json({
+                        "type": "detections",
+                        "timestamp": msg.get("timestamp", 0),
+                        "width": frame.shape[1],
+                        "height": frame.shape[0],
+                        "detections": detections
                     })
-            frame_idx += 1
-        cap.release()
 
-        return {
-            "filename": file.filename,
-            "total_frames_processed": frame_idx,
-            "suspicious_events_count": len(timeline),
-            "timeline": timeline
-        }
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+            elif action == "start_stream":
+                if stream_task and not stream_task.done():
+                    stream_task.cancel()
+                url = msg.get("url", "").strip()
+                if url:
+                    stream_task = asyncio.create_task(run_cctv_stream(url))
+
+            elif action == "stop_stream":
+                if stream_task and not stream_task.done():
+                    stream_task.cancel()
+                    stream_task = None
+
+    except WebSocketDisconnect:
+        if stream_task and not stream_task.done():
+            stream_task.cancel()
